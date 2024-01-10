@@ -1,10 +1,6 @@
-
-import utils
-from utils import *
-from train import *
-from unets import UNetModule
-from torch.utils.tensorboard import SummaryWriter
-import torchvision
+from tqdm import tqdm
+import torch
+import torch.nn as nn
 
 """
     Implementation of DDPM paper (https://arxiv.org/abs/2006.11239) from scratch.
@@ -59,8 +55,31 @@ class Diffusion:
         """
         return torch.randint(1, self.T, (n,))
 
+    def p_sample(self, model, x, t):
+        model.eval()
+        # use the model to predict noise to be removed
+        predicted_noise = model(x, t)
+        alpha = self.alpha[t][:, None, None, None]
+        sqrt_one_minus_alpha_bar = self.sqrt_one_minus_alpha_bar[t][:, None, None, None]
+        beta = self.beta[t][:, None, None, None]
+        noise = torch.randn_like(x)
+        nonzero_mask = (
+            (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
+        )
+        sample = 1 / torch.sqrt(alpha) * (x - (1 - alpha) / self.sqrt_one_minus_alpha_bar * predicted_noise) + nonzero_mask * torch.sqrt(
+                    self.beta) * noise
+        #if i > 1:
+        #    z = torch.randn_like(x)
+        # don't add noise variance for first timestamp
+        #else:
+        #    z = torch.zeros_like(x)
+        #sample = 1 / torch.sqrt(alpha) * (x - (1 - alpha) / sqrt_one_minus_alpha_bar * predicted_noise) + torch.sqrt(
+        #            beta) * z
+        return {"sample": sample}
+
+
     # reverse process, p_theta.
-    def generate_images(self, model, n):
+    def p_sample_n_from_rand_noise(self, model, n):
         """
         Generate images implements the sampling algorithm (Algorithm 2 of the DDPM paper). The sampling algorithm samples for each image, random noise from a centered normal distribution and denoises it T times, following the model noise prediction.
         :param model: parametrized model used to sample images
@@ -75,20 +94,20 @@ class Diffusion:
             for i in tqdm(reversed(range(1, self.T)), position=0):
                 t = (torch.ones(n) * i).long().to(self.device)
                 # use the model to predict noise to be removed
-                predicted_noise = model(x, t)
-                alpha = self.alpha[t][:, None, None, None]
-                sqrt_one_minus_alpha_bar = self.sqrt_one_minus_alpha_bar[t][:, None, None, None]
-                beta = self.beta[t][:, None, None, None]
-                if i > 1:
-                    z = torch.randn_like(x)
-                # don't add noise variance for first timestamp
-                else:
-                    z = torch.zeros_like(x)
-                x = 1 / torch.sqrt(alpha) * (x - (1 - alpha) / sqrt_one_minus_alpha_bar * predicted_noise) + torch.sqrt(
-                    beta) * z
-        model.train()
-        x = (x.clamp(-1, 1) + 1) / 2
+                sampled_out = self.p_sample(model, x, t)
+                sample = sampled_out["sample"]
+                mean = sample.mean()
+                std = sample.std()
+                normalized_sample = (sample - mean) / std
+                # Scale to the range [-1, 1]
+                normalized_tensor = 2 * (normalized_sample - normalized_sample.min()) / (normalized_sample.max() - normalized_sample.min()) - 1
+                x = normalized_tensor
+
+        #model.train()
+        x = (x + 1) / 2
         x = (x * 255).type(torch.uint8)
+        print(f"p_sample_n_from_rand_noise, x AFTER the resize and conversion: {x}")
+
         return x
 
     def training_losses(self, model_output, noise, t, x0, xt):

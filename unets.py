@@ -8,39 +8,6 @@ def one_param(m):
     return next(iter(m.parameters()))
 
 
-class GroupNorm32(nn.GroupNorm):
-    def forward(self, x):
-        return super().forward(x.float()).type(x.dtype)
-
-
-class EMA:
-    def __init__(self, beta):
-        super().__init__()
-        self.beta = beta
-        self.step = 0
-
-    def update_model_average(self, ma_model, current_model):
-        for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
-            old_weight, up_weight = ma_params.data, current_params.data
-            ma_params.data = self.update_average(old_weight, up_weight)
-
-    def update_average(self, old, new):
-        if old is None:
-            return new
-        return old * self.beta + (1 - self.beta) * new
-
-    def step_ema(self, ema_model, model, step_start_ema=2000):
-        if self.step < step_start_ema:
-            self.reset_parameters(ema_model, model)
-            self.step += 1
-            return
-        self.update_model_average(ema_model, model)
-        self.step += 1
-
-    def reset_parameters(self, ema_model, model):
-        ema_model.load_state_dict(model.state_dict())
-
-
 class SelfAttention(nn.Module):
     """
     Self attention module using multi-head attention
@@ -96,8 +63,8 @@ class DownSample(nn.Module):
             pooling_layer = nn.AvgPool2d(2)
         self.pool_conv = nn.Sequential(
             pooling_layer,
-            DoubleConv(in_channels, in_channels, residual=True),
-            DoubleConv(in_channels, out_channels),
+            DoubleConv(in_channels=in_channels, out_channels=in_channels, residual=True),
+            DoubleConv(in_channels=in_channels, out_channels=out_channels),
         )
 
         self.emb_layer = nn.Sequential(
@@ -111,7 +78,6 @@ class DownSample(nn.Module):
     def forward(self, x, t):
         x = self.pool_conv(x)
         emb = self.emb_layer(t)[:, :, None, None].repeat(1, 1, x.shape[-2], x.shape[-1])
-        # TODO(celia): add option to use use_scale_shift_norm
         return x + emb
 
 
@@ -121,8 +87,8 @@ class UpSample(nn.Module):
 
         self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
         self.conv = nn.Sequential(
-            DoubleConv(in_channels, in_channels, residual=True),
-            DoubleConv(in_channels, out_channels, in_channels // 2),
+            DoubleConv(in_channels=in_channels, out_channels=in_channels, residual=True),
+            DoubleConv(in_channels=in_channels, out_channels=out_channels, mid_channels=in_channels // 2),
         )
 
         self.emb_layer = nn.Sequential(
@@ -144,7 +110,9 @@ class UpSample(nn.Module):
 class Encoder(nn.Module):
     def __init__(self, input_channels=3, conv_channels=64):
         super().__init__()
-        self.conv = DoubleConv(input_channels, conv_channels)
+        self.input_channels = input_channels
+        self.conv_channels = conv_channels
+        self.conv = DoubleConv(in_channels=input_channels, out_channels=conv_channels)
         self.downsample_1 = DownSample(conv_channels, conv_channels*2)
         self.attention_1 = SelfAttention(conv_channels*2)
         self.downsample_2 = DownSample(conv_channels*2, conv_channels*4)
@@ -206,18 +174,21 @@ class Bottleneck(nn.Module):
 
 
 class UNetModule(nn.Module):
-    def __init__(self, input_channels=3, output_channels=3, time_dim=256, equal_dim_conv=True):
+    def __init__(self, input_channels=3, output_channels=3, time_dim=256, equal_dim_conv=True, learn_var=False):
         super().__init__()
+        self.learn_var = learn_var
         self.input_channels = input_channels
         self.output_channels = output_channels
+        if learn_var:
+            self.output_channels = self.output_channels*2
+
         self.time_dimension = time_dim
         self.equal_dim_conv = equal_dim_conv
         self.encoder_channels_start = 64
         self.encoder_channels_end = self.encoder_channels_start * 4
-
-        self.encoder = Encoder(input_channels, self.encoder_channels_start)
-        self.bottleneck = Bottleneck(self.encoder_channels_end, equal_dim_conv)
-        self.decoder = Decoder(self.encoder_channels_end, output_channels)
+        self.encoder = Encoder(input_channels=self.input_channels, conv_channels=self.encoder_channels_start)
+        self.bottleneck = Bottleneck(self.encoder_channels_end, self.equal_dim_conv)
+        self.decoder = Decoder(self.encoder_channels_end, self.output_channels)
 
     def time_embeddings(self, t, time_channels):
         """
@@ -249,20 +220,4 @@ class UNetModule(nn.Module):
     def forward(self, x, t):
         t = t.unsqueeze(-1)
         t = self.time_embeddings(t, self.time_dimension)
-        return self.unet_forward(x, t)
-
-
-class UNetModuleConditional(UNetModule):
-    def __init__(self, c_in=3, c_out=3, time_dim=256, num_classes=None, **kwargs):
-        super().__init__(c_in, c_out, time_dim, **kwargs)
-        if num_classes is not None:
-            self.label_emb = nn.Embedding(num_classes, time_dim)
-
-    def forward(self, x, t, y=None):
-        t = t.unsqueeze(-1)
-        t = self.time_embeddings(t, self.time_dimension)
-
-        if y is not None:
-            t += self.label_emb(y)
-
         return self.unet_forward(x, t)
